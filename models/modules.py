@@ -37,6 +37,21 @@ class ContextRNN(nn.Module):
         outputs = self.W(outputs)
         return outputs.transpose(0,1), hidden
 
+class DomainClassifier(nn.Module):
+    def __init__(self,input_size,output_size):
+        super(DomainClassifier, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.linear1 = nn.Linear(input_size,32)
+        self.linear2 = nn.Linear(32,output_size)
+        self.logSoftmax = nn.LogSoftmax(dim=1)
+
+    def forward(self,inputs):
+        outputs = self.linear1(inputs)
+        outputs = self.linear2(outputs)
+        outputs = self.logSoftmax(outputs)
+        return outputs
+
 
 class ExternalKnowledge(nn.Module):
     def __init__(self, vocab, embedding_dim, hop, dropout):
@@ -131,22 +146,42 @@ class LocalMemoryDecoder(nn.Module):
         self.conv_layer = nn.Conv1d(embedding_dim, embedding_dim, 5, padding=2)
         self.softmax = nn.Softmax(dim = 1)
 
-    def forward(self, extKnow, story_size, story_lengths, copy_list, encode_hidden, target_batches, max_target_length, batch_size, use_teacher_forcing, get_decoded_words, global_pointer):
+    def forward(self, extKnow, story_size, story_lengths, copy_list, encode_hidden, target_batches, max_target_length, batch_size, use_teacher_forcing, get_decoded_words, global_pointer,cls_outputs,column_index,kb_arr_lengths):
         # Initialize variables for vocab and pointer
         all_decoder_outputs_vocab = _cuda(torch.zeros(max_target_length, batch_size, self.num_vocab))
-        all_decoder_outputs_ptr = _cuda(torch.zeros(max_target_length, batch_size, story_size[1]))
+        all_decoder_outputs_ptr = _cuda(torch.zeros(max_target_length, batch_size, story_size[1] * story_size[2]))
         decoder_input = _cuda(torch.LongTensor([SOS_token] * batch_size))
-        memory_mask_for_step = _cuda(torch.ones(story_size[0], story_size[1]))
+        memory_mask_for_step = _cuda(torch.ones(story_size[0], story_size[1],story_size[2]))
         decoded_fine, decoded_coarse = [], []
+
+        embed_column_names = self.C(column_index)
         
         hidden = self.relu(self.projector(encode_hidden)).unsqueeze(0)
+        if (len(cls_outputs) == 1):
+            cls_outputs = cls_outputs.squeeze(0)
         
         # Start to generate word-by-word
         for t in range(max_target_length):
             embed_q = self.dropout_layer(self.C(decoder_input)) # b * e
             if len(embed_q.size()) == 1: embed_q = embed_q.unsqueeze(0)
             _, hidden = self.sketch_rnn(embed_q.unsqueeze(0), hidden)
-            query_vector = hidden[0] 
+            query_vector = hidden[0]
+
+            query_column = query_vector.unsqueeze(1)
+            query_column = query_column.unsqueeze(1).expand_as(embed_column_names)
+            column_scores_all = torch.sum(query_column*embed_column_names,dim=-1)
+            # print(cls_outputs.size())
+            #
+            # # print(query_vector.size())
+            # # print(cls_outputs.size())
+            # # print(column_scores_all.size())
+            # # print(domain_scores)
+            # print(cls_outputs.size())
+            # print(column_scores_all.size())
+            domain_scores = cls_outputs.unsqueeze(2).expand_as(column_scores_all)
+
+            column_scores = torch.sum(domain_scores*column_scores_all,dim=1)
+
             
             p_vocab = self.attend_vocab(self.C.weight, hidden.squeeze(0))
             all_decoder_outputs_vocab[t] = p_vocab
@@ -154,7 +189,35 @@ class LocalMemoryDecoder(nn.Module):
             
             # query the external konwledge using the hidden state of sketch RNN
             prob_soft, prob_logits = extKnow(query_vector, global_pointer)
-            all_decoder_outputs_ptr[t] = prob_logits
+
+            prob_all = prob_soft.unsqueeze(-1).expand(prob_soft.size(0),prob_soft.size(1),column_index.size(-1))
+
+            kb_column_scores = column_scores.unsqueeze(1).expand_as(prob_all)
+            conv_scores = []
+            for i,kb_length in enumerate(kb_arr_lengths):
+                conv_score = prob_all[i,kb_length:,:]
+                column_flag = torch.zeros(story_size[2])
+                column_flag[0] = 1
+                column_flag = column_flag.unsqueeze(0).expand_as(conv_score)
+                # conv_score[:,1:] = 0
+                conv_score = conv_score * column_flag
+                conv_scores.append(conv_score)
+
+            prob_all_scores = prob_all*kb_column_scores
+            for i,kb_length in enumerate(kb_arr_lengths):
+                prob_all_scores[i,kb_length:,:] = conv_scores[i]
+            prob_all_scores = prob_all_scores.view(batch_size,-1)
+            all_decoder_outputs_ptr[t] = prob_all_scores
+
+            # prob_kb = prob_all[:,:kb_arr_lengths,:]
+            # prob_conv_pad = prob_all[:,kb_arr_lengths:,1:]
+            # kb_column_scores = column_scores.unsqueeze(1).expand_as(prob_kb)
+            # prob_all[:,:kb_arr_lengths,:] = kb_column_scores * prob_all[:,:kb_arr_lengths,:]
+            # prob_all[:,kb_arr_lengths:,1:] -= prob_conv_pad
+            # prob_all = prob_all.view(batch_size,-1)
+            # all_decoder_outputs_ptr[t] = prob_all
+
+            # all_decoder_outputs_ptr[t] = prob_logits
 
             if use_teacher_forcing:
                 decoder_input = target_batches[:,t] 
@@ -163,9 +226,15 @@ class LocalMemoryDecoder(nn.Module):
             
             if get_decoded_words:
 
-                search_len = min(5, min(story_lengths))
-                prob_soft = prob_soft * memory_mask_for_step
-                _, toppi = prob_soft.data.topk(search_len)
+                search_len = min(10, min(story_lengths * story_size[2]))
+                # prob_soft = prob_soft * memory_mask_for_step
+                # _, toppi = prob_soft.data.topk(search_len)
+
+                prob_all_scores = prob_all_scores.view_as(memory_mask_for_step)
+                # print(prob_all_scores.size())
+                # print(memory_mask_for_step.size())
+                prob_all = prob_all_scores * memory_mask_for_step
+                _, toppi = prob_all.view(batch_size, -1).data.topk(search_len)
                 temp_f, temp_c = [], []
                 
                 for bi in range(batch_size):
@@ -175,13 +244,13 @@ class LocalMemoryDecoder(nn.Module):
                     if '@' in self.lang.index2word[token]:
                         cw = 'UNK'
                         for i in range(search_len):
-                            if toppi[:,i][bi] < story_lengths[bi]-1: 
+                            if toppi[:,i][bi] < story_lengths[bi] * story_size[2] - story_size[2]:
                                 cw = copy_list[bi][toppi[:,i][bi].item()]            
                                 break
                         temp_f.append(cw)
                         
                         if args['record']:
-                            memory_mask_for_step[bi, toppi[:,i][bi].item()] = 0
+                            memory_mask_for_step[bi, toppi[:,i][bi].item()/story_size[2],toppi[:,i][bi].item() % story_size[2]] = 0
                     else:
                         temp_f.append(self.lang.index2word[token])
 

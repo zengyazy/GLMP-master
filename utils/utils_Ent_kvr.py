@@ -4,6 +4,7 @@ import torch.utils.data as data
 import torch.nn as nn
 from utils.config import *
 import ast
+import numpy as np
 
 from utils.utils_general import *
 
@@ -25,6 +26,12 @@ def read_langs(file_name, max_line = None):
                     contex_source += line + '\n'
                     line = line.replace("#","")
                     task_type = line
+                    if task_type == 'weather':
+                        task_label = 0
+                    elif task_type == 'navigate':
+                        task_label =1
+                    elif task_type == 'schedule':
+                        task_label =2
                     continue
 
                 nid, line = line.split(' ', 1)
@@ -46,15 +53,29 @@ def read_langs(file_name, max_line = None):
                     # Get local pointer position for each word in system response
                     ptr_index = []
                     for key in r.split():
-                        index = [loc for loc, val in enumerate(context_arr) if (val[0] == key and key in ent_index)]
+                        index = [loc for loc,val in enumerate(np.array(context_arr).flatten()) if val == key and key in ent_index]
+                        # index = [loc for loc, val in enumerate(context_arr) if (val[0] == key and key in ent_index)]
                         if (index):
                             index = max(index) 
                         else: 
-                            index = len(context_arr)
+                            index = (len(context_arr)-1)*6
                         ptr_index.append(index)
 
                     # Get global pointer labels for words in system response, the 1 in the end is for the NULL token
-                    selector_index = [1 if (word_arr[0] in ent_index or word_arr[0] in r.split()) else 0 for word_arr in context_arr] + [1]
+                    selector_index = []
+                    for word_arr in context_arr:
+                        temp = 0
+                        for word in word_arr:
+                            if word in ent_index or word in r.split():
+                                temp = 1
+                                break
+                        selector_index.append(temp)
+                    selector_index += [1]
+
+                    # kb_index = [1 if (word in ent_index or word in r.split()) else 0 for word_arr in kb_arr for word in word_arr]
+                    # conv_index = [1 if (word_arr[0] in ent_index or word_arr[0] in r.split()) else 0 for word_arr in conv_arr]
+                    # selector_index = kb_index + conv_index + [1]
+                    # selector_index = [1 if (word_arr[0] in ent_index or word_arr[0] in r.split()) else 0 for word_arr in context_arr] + [1]
                     
                     sketch_response = generate_template(global_entity, r, gold_ent, kb_arr, task_type)
                     
@@ -73,7 +94,8 @@ def read_langs(file_name, max_line = None):
                         'id':int(sample_counter),
                         'ID':int(cnt_lin),
                         'domain':task_type,
-                        'context_source':contex_source}
+                        'context_source':contex_source,
+                        'task_label':task_label}
                     data.append(data_detail)
                     
                     gen_r = generate_memory(r, "$s", str(nid)) 
@@ -108,25 +130,43 @@ def generate_template(global_entity, sentence, sent_ent, kb_arr, domain):
         for word in sentence.split():
             if word not in sent_ent:
                 sketch_response.append(word)
-            else: 
+            else:
                 ent_type = None
-                if domain != 'weather':
-                    for kb_item in kb_arr:
-                        if word == kb_item[0]:
-                            ent_type = kb_item[1]
+                for key in global_entity.keys():
+                    if key != 'poi':
+                        global_entity[key] = [x.lower() for x in global_entity[key]]
+                        if word in global_entity[key] or word.replace('_', ' ') in global_entity[key]:
+                            ent_type = key
                             break
-                if ent_type == None:
-                    for key in global_entity.keys():
-                        if key!='poi':
-                            global_entity[key] = [x.lower() for x in global_entity[key]]
-                            if word in global_entity[key] or word.replace('_', ' ') in global_entity[key]:
-                                ent_type = key
-                                break
-                        else:
-                            poi_list = [d['poi'].lower() for d in global_entity['poi']]
-                            if word in poi_list or word.replace('_', ' ') in poi_list:
-                                ent_type = key
-                                break
+                    else:
+                        for d in global_entity['poi']:
+                            for key in d.keys():
+                                d[key] = d[key].lower()
+                                if word in d[key] or word.replace('_', ' ') in d[key]:
+                                    ent_type = key
+                                    break
+                        # poi_list = [d['poi'].lower() for d in global_entity['poi']]
+                        # if word in poi_list
+                        #     break or word.replace('_', ' ') in poi_list:
+                        #                         #     ent_type = key
+                # ent_type = None
+                # if domain != 'weather':
+                #     for kb_item in kb_arr:
+                #         if word == kb_item[0]:
+                #             ent_type = kb_item[1]
+                #             break
+                # if ent_type == None:
+                #     for key in global_entity.keys():
+                #         if key!='poi':
+                #             global_entity[key] = [x.lower() for x in global_entity[key]]
+                #             if word in global_entity[key] or word.replace('_', ' ') in global_entity[key]:
+                #                 ent_type = key
+                #                 break
+                #         else:
+                #             poi_list = [d['poi'].lower() for d in global_entity['poi']]
+                #             if word in poi_list or word.replace('_', ' ') in poi_list:
+                #                 ent_type = key
+                #                 break
                 sketch_response.append('@'+ent_type)        
     sketch_response = " ".join(sketch_response)
     return sketch_response
@@ -140,7 +180,7 @@ def generate_memory(sent, speaker, time):
             temp = [word, speaker, 'turn'+str(time), 'word'+str(idx)] + ["PAD"]*(MEM_TOKEN_SIZE-4)
             sent_new.append(temp)
     else:
-        sent_token = sent_token[::-1] + ["PAD"]*(MEM_TOKEN_SIZE-len(sent_token))
+        sent_token = sent_token + ["PAD"]*(MEM_TOKEN_SIZE-len(sent_token))
         sent_new.append(sent_token)
     return sent_new
 
@@ -160,6 +200,7 @@ def prepare_data_seq(task, batch_size=100):
     train = get_seq(pair_train, lang, batch_size, True)
     dev = get_seq(pair_dev, lang, batch_size, False)
     test = get_seq(pair_test, lang, batch_size, False)
+
     
     print("Read %s sentence pairs train" % len(pair_train))
     print("Read %s sentence pairs dev" % len(pair_dev))

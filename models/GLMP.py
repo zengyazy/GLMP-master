@@ -31,43 +31,51 @@ class GLMP(nn.Module):
         self.max_resp_len = max_resp_len
         self.decoder_hop = n_layers
         self.softmax = nn.Softmax(dim=0)
+        self.domainNumber = 3
 
         if path:
             if USE_CUDA:
                 print("MODEL {} LOADED".format(str(path)))
                 self.encoder = torch.load(str(path)+'/enc.th')
+                self.domainClassifier = torch.load(str(path)+'/cls.th')
                 self.extKnow = torch.load(str(path)+'/enc_kb.th')
                 self.decoder = torch.load(str(path)+'/dec.th')
             else:
                 print("MODEL {} LOADED".format(str(path)))
                 self.encoder = torch.load(str(path)+'/enc.th',lambda storage, loc: storage)
+                self.domainClassifier = torch.load(str(path)+'/cls.th',lambda storage, loc: storage)
                 self.extKnow = torch.load(str(path)+'/enc_kb.th',lambda storage, loc: storage)
                 self.decoder = torch.load(str(path)+'/dec.th',lambda storage, loc: storage)
         else:
             self.encoder = ContextRNN(lang.n_words, hidden_size, dropout)
+            self.domainClassifier = DomainClassifier(hidden_size, self.domainNumber)
             self.extKnow = ExternalKnowledge(lang.n_words, hidden_size, n_layers, dropout)
             self.decoder = LocalMemoryDecoder(self.encoder.embedding, lang, hidden_size, self.decoder_hop, dropout) #Generator(lang, hidden_size, dropout)
 
         # Initialize optimizers and criterion
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), lr=lr)
+        self.domainClassifier_optimizer = optim.Adam(self.domainClassifier.parameters(), lr=lr)
         self.extKnow_optimizer = optim.Adam(self.extKnow.parameters(), lr=lr)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), lr=lr)
         self.scheduler = lr_scheduler.ReduceLROnPlateau(self.decoder_optimizer, mode='max', factor=0.5, patience=1, min_lr=0.0001, verbose=True)
         self.criterion_bce = nn.BCELoss()
+        self.criterion_cls = nn.NLLLoss()
         self.reset()
 
         if USE_CUDA:
             self.encoder.cuda()
+            self.domainClassifier.cuda()
             self.extKnow.cuda()
             self.decoder.cuda()
 
     def print_loss(self):    
         print_loss_avg = self.loss / self.print_every
         print_loss_g = self.loss_g / self.print_every
+        print_loss_c = self.loss_c / self.print_every
         print_loss_v = self.loss_v / self.print_every
         print_loss_l = self.loss_l / self.print_every
         self.print_every += 1     
-        return 'L:{:.2f},LE:{:.2f},LG:{:.2f},LP:{:.2f}'.format(print_loss_avg, print_loss_g, print_loss_v, print_loss_l)
+        return 'L:{:.2f},LE:{:.2f},LG:{:.2f},LC:{:.2f},LP:{:.2f}'.format(print_loss_avg, print_loss_g, print_loss_v, print_loss_c, print_loss_l)
     
     def save_model(self, dec_type):
         name_data = "KVR/" if self.task=='' else "BABI/"
@@ -76,11 +84,12 @@ class GLMP(nn.Module):
         if not os.path.exists(directory):
             os.makedirs(directory)
         torch.save(self.encoder, directory + '/enc.th')
+        torch.save(self.domainClassifier, directory + '/cls.th')
         torch.save(self.extKnow, directory + '/enc_kb.th')
         torch.save(self.decoder, directory + '/dec.th')
 
     def reset(self):
-        self.loss, self.print_every, self.loss_g, self.loss_v, self.loss_l = 0, 1, 0, 0, 0
+        self.loss, self.print_every, self.loss_g, self.loss_c, self.loss_v, self.loss_l = 0, 1, 0, 0, 0, 0
     
     def _cuda(self, x):
         if USE_CUDA:
@@ -92,16 +101,25 @@ class GLMP(nn.Module):
         if reset: self.reset()
         # Zero gradients of both optimizers
         self.encoder_optimizer.zero_grad()
+        self.domainClassifier_optimizer.zero_grad()
         self.extKnow_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
         
         # Encode and Decode
         use_teacher_forcing = random.random() < args['teacher_forcing_ratio'] 
         max_target_length = max(data['response_lengths'])
-        all_decoder_outputs_vocab, all_decoder_outputs_ptr, _, _, global_pointer = self.encode_and_decode(data, max_target_length, use_teacher_forcing, False)
+        all_decoder_outputs_vocab, all_decoder_outputs_ptr, _, _, global_pointer, cls_outputs = self.encode_and_decode(data, max_target_length, use_teacher_forcing, False)
         
         # Loss calculation and backpropagation
+        # print(global_pointer.size())
+        # print(data['selector_index'].size())
+        # print(cls_outputs)
+        if len(cls_outputs) == 1:
+            cls_outputs = cls_outputs.squeeze(0)
+        # print(cls_outputs)
+        # print(data['task_label'])
         loss_g = self.criterion_bce(global_pointer, data['selector_index'])
+        loss_c = self.criterion_cls(cls_outputs,data['task_label'])
         loss_v = masked_cross_entropy(
             all_decoder_outputs_vocab.transpose(0, 1).contiguous(), 
             data['sketch_response'].contiguous(), 
@@ -110,24 +128,28 @@ class GLMP(nn.Module):
             all_decoder_outputs_ptr.transpose(0, 1).contiguous(), 
             data['ptr_index'].contiguous(), 
             data['response_lengths'])
-        loss = loss_g + loss_v + loss_l
+        loss = loss_g + loss_v + loss_l + loss_c
         loss.backward()
 
         # Clip gradient norms
         ec = torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), clip)
+        cls = torch.nn.utils.clip_grad_norm_(self.domainClassifier.parameters(), clip)
         ec = torch.nn.utils.clip_grad_norm_(self.extKnow.parameters(), clip)
         dc = torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), clip)
 
         # Update parameters with optimizers
         self.encoder_optimizer.step()
+        self.domainClassifier_optimizer.step()
         self.extKnow_optimizer.step()
         self.decoder_optimizer.step()
         self.loss += loss.item()
         self.loss_g += loss_g.item()
+        self.loss_c += loss_c.item()
         self.loss_v += loss_v.item()
         self.loss_l += loss_l.item()
     
     def encode_and_decode(self, data, max_target_length, use_teacher_forcing, get_decoded_words):
+
         # Build unknown mask for memory
         if args['unk_mask'] and self.decoder.training:
             story_size = data['context_arr'].size()
@@ -147,6 +169,7 @@ class GLMP(nn.Module):
         
         # Encode dialog history and KB to vectors
         dh_outputs, dh_hidden = self.encoder(conv_story, data['conv_arr_lengths'])
+        cls_outputs = self.domainClassifier(dh_hidden)
         global_pointer, kb_readout = self.extKnow.load_memory(story, data['kb_arr_lengths'], data['conv_arr_lengths'], dh_hidden, dh_outputs)
         encoded_hidden = torch.cat((dh_hidden.squeeze(0), kb_readout), dim=1) 
         
@@ -154,7 +177,8 @@ class GLMP(nn.Module):
         batch_size = len(data['context_arr_lengths'])
         self.copy_list = []
         for elm in data['context_arr_plain']:
-            elm_temp = [ word_arr[0] for word_arr in elm ]
+            elm_temp = [word for word_arr in elm for word in word_arr]
+            # elm_temp = [ word_arr[0] for word_arr in elm ]
             self.copy_list.append(elm_temp) 
         
         outputs_vocab, outputs_ptr, decoded_fine, decoded_coarse = self.decoder.forward(
@@ -168,9 +192,12 @@ class GLMP(nn.Module):
             batch_size, 
             use_teacher_forcing, 
             get_decoded_words, 
-            global_pointer) 
+            global_pointer,
+            cls_outputs,
+            data['column_index'],
+            data['kb_arr_lengths'])
 
-        return outputs_vocab, outputs_ptr, decoded_fine, decoded_coarse, global_pointer
+        return outputs_vocab, outputs_ptr, decoded_fine, decoded_coarse, global_pointer, cls_outputs
 
     def generate(self,test):
         self.encoder.train(False)
@@ -184,7 +211,7 @@ class GLMP(nn.Module):
         conversation_gen = []
         pbar = tqdm(enumerate(test), total=len(test))
         for j, data_test in pbar:
-            _, _, decoded_fine, decoded_coarse, global_pointer = self.encode_and_decode(data_test, self.max_resp_len, False,
+            _, _, decoded_fine, decoded_coarse, global_pointer,_ = self.encode_and_decode(data_test, self.max_resp_len, False,
                                                                                         True)
             decoded_coarse = np.transpose(decoded_coarse)
             decoded_fine = np.transpose(decoded_fine)
@@ -245,7 +272,7 @@ class GLMP(nn.Module):
 
         for j, data_dev in pbar: 
             # Encode and Decode
-            _, _, decoded_fine, decoded_coarse, global_pointer = self.encode_and_decode(data_dev, self.max_resp_len, False, True)
+            _, _, decoded_fine, decoded_coarse, global_pointer, _ = self.encode_and_decode(data_dev, self.max_resp_len, False, True)
             decoded_coarse = np.transpose(decoded_coarse)
             decoded_fine = np.transpose(decoded_fine)
             for bi, row in enumerate(decoded_fine):

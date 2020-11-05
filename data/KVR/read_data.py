@@ -74,7 +74,7 @@ if __name__ == "__main__":
                         default='kvret_dev_public.json',
                         help='process json file')
     args = parser.parse_args()
-    gen_file = 'dev1.txt'
+    gen_file = 'dev.txt'
     gen_f = open(gen_file,"w")
 
     with open(args.json) as f:
@@ -115,7 +115,7 @@ if __name__ == "__main__":
                     el['address']: el['address'].replace(" ", "_"),
                 }
                 # print(di)
-                gen_f.write("0 "+poi+" "+di[el['poi_type']]+" "+di[el['distance']]+" "+di[el['traffic_info']]+" "+di[el['address']])
+                gen_f.write("0 "+poi+" "+di[el['poi_type']]+" "+di[el['distance']]+" "+di[el['traffic_info']]+" "+di[el['address']]+" "+"-")
                 gen_f.write('\n')
                 # print("0 "+poi+" "+di[el['poi_type']]+" "+di[el['distance']]+" "+di[el['traffic_info']]+" "+di[el['address']])
                 # print("0 "+di[el['distance']]+" "+di[el['traffic_info']]+" "+di[el['poi_type']]+" poi "+poi)
@@ -177,7 +177,7 @@ if __name__ == "__main__":
                 days = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
                 for day in days:
                     # print("0 " +loc+" "+day+" "+el[day].split(',')[0].rstrip().replace(" ", "_")+" "+el[day].split(',')[1].split(" ")[3]+" "+el[day].split(',')[2].split(" ")[3])
-                    gen_f.write("0 " +loc+" "+day+" "+el[day].split(',')[0].rstrip().replace(" ", "_")+" "+el[day].split(',')[1].split(" ")[3]+" "+el[day].split(',')[2].split(" ")[3])
+                    gen_f.write("0 " +loc+" "+day+" "+el[day].split(',')[0].rstrip().replace(" ", "_")+" "+el[day].split(',')[1].split(" ")[3]+" "+el[day].split(',')[2].split(" ")[3]+" "+"-")
                     gen_f.write('\n')
                     # print("0 "+loc+" "+day+" "+ el[day].split(',')[0].rstrip().replace(" ", "_"))
                     # print("0 "+loc+" "+day+" "+ el[day].split(',')[1].split(" ")[1] +" "+el[day].split(',')[1].split(" ")[3])
@@ -223,6 +223,8 @@ if __name__ == "__main__":
                 for el in d['scenario']['kb']['items']:
                     for el_key in el.keys():
                         el[el_key] = " ".join(tokenizer(el[el_key])).lower()
+                        if el[el_key] == "-":
+                            el[el_key] = "PAD"
                     ev = el['event'].replace(" ", "_")
                     names[el['event']] = ev
                     slots = ['time','date','party','room','agenda']

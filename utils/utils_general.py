@@ -2,6 +2,7 @@ import torch
 import torch.utils.data as data
 import torch.nn as nn
 from utils.config import *
+import numpy as np
 
 def _cuda(x):
     if USE_CUDA:
@@ -48,6 +49,10 @@ class Dataset(data.Dataset):
         """Returns one data pair (source and target)."""
         context_arr = self.data_info['context_arr'][index]
         context_source = self.data_info['context_source'][index]
+        column_index = self.data_info['column_index'][index]
+        task_type = self.data_info['domain'][index]
+        task_type = self.src_word2id[task_type]
+        task_label = self.data_info['task_label'][index]
 
         context_arr = self.preprocess(context_arr, self.src_word2id, trg=False)
         response = self.data_info['response'][index]
@@ -117,6 +122,21 @@ class Dataset(data.Dataset):
                 end = lengths[i]
                 padded_seqs[i, :end] = seq[:end]    
             return padded_seqs, lengths
+
+        def merge_task_labels(labels):
+            length = len(labels)
+            padded_labels = torch.zeros(length).long()
+            for i,label in enumerate(labels):
+                padded_labels[i] = label
+            return padded_labels
+
+        def merg_column_index(batch):
+            length = len(batch)
+            padded_columns = torch.zeros(length,batch[0].size(0),batch[0].size(1)).long()
+            for i,columns in enumerate(batch):
+                padded_columns[i,:,:] = batch[i]
+            return padded_columns
+
         
         # sort a list by sequence length (descending order) to use pack_padded_sequence
         data.sort(key=lambda x: len(x['conv_arr']), reverse=True) 
@@ -132,7 +152,8 @@ class Dataset(data.Dataset):
         conv_arr, conv_arr_lengths = merge(item_info['conv_arr'], True)
         sketch_response, _ = merge(item_info['sketch_response'], False)
         kb_arr, kb_arr_lengths = merge(item_info['kb_arr'], True)
-        
+        task_label = merge_task_labels(item_info['task_label'])
+        column_index = merg_column_index(item_info['column_index'])
         # convert to contiguous and cuda
         context_arr = _cuda(context_arr.contiguous())
         response = _cuda(response.contiguous())
@@ -140,6 +161,10 @@ class Dataset(data.Dataset):
         ptr_index = _cuda(ptr_index.contiguous())
         conv_arr = _cuda(conv_arr.transpose(0,1).contiguous())
         sketch_response = _cuda(sketch_response.contiguous())
+        task_label = _cuda(task_label.contiguous())
+        # print(item_info['column_index'])
+        column_index = _cuda(column_index.contiguous())
+
         if(len(list(kb_arr.size()))>1): kb_arr = _cuda(kb_arr.transpose(0,1).contiguous())
         
         # processed information
@@ -159,19 +184,35 @@ class Dataset(data.Dataset):
         return data_info
 
 
-def get_seq(pairs, lang, batch_size, type):   
+def get_seq(pairs, lang, batch_size, type):
+    column_names = [["poi", "type", "distance", "traffic_info", "address", "-"],
+                    ["location", "date", "weather_attribute", "lowest_temperature", "highest_temperature", "-"],
+                    ["event", "date", "time", "party", "room", "agenda"]]
+    column_index = torch.zeros(np.array(column_names).shape)
+    for i, domain in enumerate(column_names):
+        for j, column in enumerate(domain):
+            lang.index_word(column)
+            column_index[i, j] = lang.word2index[column]
     data_info = {}
     for k in pairs[0].keys():
         data_info[k] = []
+    data_info['column_index'] = []
     
     for pair in pairs:
         for k in pair.keys():
             data_info[k].append(pair[k])
+            data_info['column_index'].append(column_index)
         if(type):
             lang.index_words(pair['context_arr'])
             lang.index_words(pair['response'], trg=True)
             lang.index_words(pair['sketch_response'], trg=True)
-    
+            lang.index_words(pair['domain'], trg=True)
+
+
+    # print("keys",pairs[0].keys())
+    # print("Sample from data_info")
+    # for key in data_info.keys():
+    #     print(key,":",data_info[key][1])
     dataset = Dataset(data_info, lang.word2index, lang.word2index)
     data_loader = torch.utils.data.DataLoader(dataset = dataset,
                                               batch_size = batch_size,
